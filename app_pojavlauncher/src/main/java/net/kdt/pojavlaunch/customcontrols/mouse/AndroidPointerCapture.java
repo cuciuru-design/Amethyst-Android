@@ -85,6 +85,10 @@ public class AndroidPointerCapture implements ViewTreeObserver.OnWindowFocusChan
 
     @Override
     public boolean onCapturedPointer(View view, MotionEvent event) {
+        // Reset per-batch delta accumulators so coalesced sendCursorPos reports
+        // only the total movement of THIS batch (not leftover from previous).
+        CallbackBridge.deltaX = 0;
+        CallbackBridge.deltaY = 0;
         checkSameDevice(event.getDevice());
         int axisX, axisY;
         // Sources can claim to be a relative device by belonging to the trackball class, if so then
@@ -103,17 +107,24 @@ public class AndroidPointerCapture implements ViewTreeObserver.OnWindowFocusChan
         // Yes, we actually not only receive relative mouse events here, but also absolute touchpad ones!
         // Therefore, we need to know when it's a touchpad and when it's a mouse.
         if ((event.getSource() & InputDevice.SOURCE_CLASS_TRACKBALL) != 0){
-            processBatchEvents(event, axisX, axisY, this::processMousePos);
+            // Coalesce: accumulate all historical + current deltas without sending,
+            // then sendCursorPos() once with the total. This avoids N+1 synchronous
+            // JNI/SDL calls on the UI thread per captured pointer event.
+            processBatchEvents(event, axisX, axisY, (e) -> processMousePos(e, false));
             mVector[0] = event.getAxisValue(axisX);
             mVector[1] = event.getAxisValue(axisY);
-            return processAndSendMotionEvent(event);
+            boolean result = processAndSendMotionEvent(event, false);
+            if (CallbackBridge.isGrabbing()) {
+                CallbackBridge.sendCursorPos(CallbackBridge.mouseX, CallbackBridge.mouseY);
+            }
+            return result;
         }
         // If it's not a trackball, it's likely a touchpad and needs tracking like a touchscreen.
         processBatchEvents(event, MotionEvent.AXIS_X, MotionEvent.AXIS_Y, mPointerTracker::trackEvent);
         // Touchscreens should never be using relative axis...right? Well it's an easy fix if there's
         // a bug report!
         mPointerTracker.trackEvent(event); // This also updates the mVector variable.
-        return processAndSendMotionEvent(event);
+        return processAndSendMotionEvent(event, true);
     }
 
     /**
@@ -136,7 +147,7 @@ public class AndroidPointerCapture implements ViewTreeObserver.OnWindowFocusChan
         }
     }
 
-    private void processMousePos(MotionEvent event) {
+    private void processMousePos(MotionEvent event, boolean send) {
         if(!CallbackBridge.isGrabbing()) {
             enableTouchpadIfNecessary();
             // Yes, if the user's touchpad is multi-touch we will also receive events for that.
@@ -150,19 +161,26 @@ public class AndroidPointerCapture implements ViewTreeObserver.OnWindowFocusChan
                 mScroller.performScroll(mVector);
             }
         } else {
-            // Position is updated by many events, hence it is send regardless of the event value
+            // Position is updated by many events; accumulate deltas. sendCursorPos() is
+            // invoked by the caller once per batch (coalescing) to reduce UI-thread load.
             float deltaX = mVector[0] * LauncherPreferences.PREF_SCALE_FACTOR;
             float deltaY = mVector[1] * LauncherPreferences.PREF_SCALE_FACTOR;
             CallbackBridge.mouseX += deltaX;
             CallbackBridge.mouseY += deltaY;
-            CallbackBridge.deltaX = deltaX;
-            CallbackBridge.deltaY = deltaY;
-            CallbackBridge.sendCursorPos(CallbackBridge.mouseX, CallbackBridge.mouseY);
+            CallbackBridge.deltaX += deltaX;
+            CallbackBridge.deltaY += deltaY;
+            if (send) {
+                CallbackBridge.sendCursorPos(CallbackBridge.mouseX, CallbackBridge.mouseY);
+            }
         }
     }
 
     private boolean processAndSendMotionEvent(MotionEvent event) {
-        processMousePos(event);
+        return processAndSendMotionEvent(event, true);
+    }
+
+    private boolean processAndSendMotionEvent(MotionEvent event, boolean send) {
+        processMousePos(event, send);
 
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_MOVE:
@@ -186,6 +204,7 @@ public class AndroidPointerCapture implements ViewTreeObserver.OnWindowFocusChan
     }
 
     private void checkSameDevice(InputDevice inputDevice) {
+        if (inputDevice == null) return; // Guard against null InputDevice (trackball/pointer events)
         int newIdentifier = inputDevice.getId();
         if(mInputDeviceIdentifier != newIdentifier) {
             reinitializeDeviceSpecificProperties(inputDevice);
